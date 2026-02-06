@@ -1,0 +1,902 @@
+import os
+# 抑制 macOS 上惱人的 Tkinter 版本警告
+os.environ['TK_SILENCE_DEPRECATION'] = '1'
+
+import tkinter as tk
+from tkinter import filedialog, scrolledtext, messagebox
+import subprocess
+import time
+import threading
+from datetime import datetime
+import re
+
+class YTRecorderApp:
+    # ---------------------------------------------------------
+    # 配色方案常數 (UI v2.7 深色主題版)
+    # ---------------------------------------------------------
+    # 狀態燈號顏色
+    COLOR_SUCCESS = "#2ecc71"
+    COLOR_ERROR = "#e74c3c"
+    COLOR_WARNING = "#f39c12"
+    COLOR_INFO = "#3498db"
+    COLOR_PRIMARY = "#27ae60"
+    COLOR_DANGER = "#c0392b"
+    
+    # 介面基底顏色 (改為深色高對比主題，解決 macOS 強制深色導致文字消失的問題)
+    BG_COLOR = "#2b2b2b"       # 視窗背景：深灰
+    FRAME_BG = "#2b2b2b"       # 框架背景：深灰
+    TEXT_COLOR = "#ffffff"     # 一般文字：純白 (關鍵修正：確保在深底上可見)
+    ENTRY_BG = "#404040"       # 輸入框背景：稍亮灰
+    ENTRY_FG = "#ffffff"       # 輸入框文字：純白
+    CURSOR_COLOR = "#ffffff"   # 輸入游標顏色：白 (避免看不見游標)
+    BORDER_COLOR = "#555555"   # 邊框顏色
+    
+    # 偽裝用的 Header，解決 403 問題
+    USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+    REFERER = "https://www.youtube.com/"
+
+    def __init__(self, root):
+        self.root = root
+        self.root.title("YouTube 直播錄製神器 (macOS版) v2.8 - macOS 欄位修復版")
+        self.root.geometry("920x850")
+        self.root.minsize(800, 700)
+        
+        # 強制設定主視窗背景顏色
+        self.root.configure(bg=self.BG_COLOR)
+        
+        # [關鍵修正] 建立一個主容器 Frame 填滿整個視窗
+        self.main_container = tk.Frame(self.root, bg=self.BG_COLOR)
+        self.main_container.pack(fill="both", expand=True)
+
+        # 變數初始化
+        self.is_monitoring = False
+        self.monitor_thread = None
+        self.stop_event = threading.Event()
+
+        # Cookie 狀態變數
+        self.cookie_status_var = tk.StringVar(value="等待檢查...")
+
+        # Cookie 測試目標
+        self.cookie_test_url_var = tk.StringVar(
+            value="https://www.youtube.com/live/KCDNSTKeiCc?si=V_R1wGF0KbhEbC6Z"
+        )
+
+        # 檢測間隔（預設值為 300 秒）
+        self.check_interval_var = tk.StringVar(value="300")
+
+        # 預設路徑
+        default_dir = os.path.join(
+            os.path.expanduser("~"), "Downloads", "yt_recorder_downloads"
+        )
+        self.download_dir = tk.StringVar(value=default_dir)
+
+        # 預設頻道
+        self.channel_url = tk.StringVar(value="https://www.youtube.com/@Umitw46/live")
+
+        # 新增：測試影片 URL
+        self.test_video_url = tk.StringVar(value="")
+
+        # 建立介面
+        self.create_widgets()
+
+        # 綁定快速鍵
+        self.root.bind('<Control-s>', lambda e: self.toggle_monitoring())
+        self.root.bind('<Control-l>', lambda e: self.clear_logs())
+
+        # 延遲執行 Cookie 檢查
+        self.root.after(1000, lambda: self.check_cookies_thread(silent=True))
+
+    def create_widgets(self):
+        """建立 GUI 元件"""
+        # 通用樣式設定 (用於減少重複代碼)
+        label_style = {"bg": self.BG_COLOR, "fg": self.TEXT_COLOR, "font": ("", 10)}
+        frame_style = {"bg": self.BG_COLOR}
+        
+        # 注意：所有元件現在都放在 self.main_container 而不是 self.root
+        
+        # 1. 核心設定區
+        config_frame = tk.LabelFrame(
+            self.main_container, text="核心設定與工具",
+            padx=15, pady=15,
+            font=("", 10, "bold"),
+            bg=self.BG_COLOR, fg=self.TEXT_COLOR, # 強制白字
+            bd=1, relief="solid" # 改用 solid 邊框在深色模式較清楚
+        )
+        config_frame.pack(fill="x", padx=10, pady=8)
+        
+        # --- 工具列 ---
+        tools_frame = tk.Frame(config_frame, **frame_style)
+        tools_frame.pack(fill="x", pady=(0, 10))
+        
+        tk.Button(
+            tools_frame,
+            text="🔄 更新 yt-dlp 核心",
+            command=self.update_ytdlp,
+            bg=self.COLOR_INFO,
+            fg="black", # 按鈕保持黑字比較好讀
+            padx=10,
+            font=("", 9)
+        ).pack(side="right")
+        
+        tk.Label(
+            tools_frame, 
+            text="遇到 403 錯誤時，請先點擊右側更新按鈕 👉", 
+            bg=self.BG_COLOR, fg="#aaaaaa", font=("", 9) # 灰色提示文字
+        ).pack(side="right", padx=10)
+
+        # Cookie 測試區
+        cookie_input_frame = tk.Frame(config_frame, **frame_style)
+        cookie_input_frame.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            cookie_input_frame,
+            text="Cookie 測試對象:",
+            **label_style
+        ).pack(side="left")
+
+        tk.Entry(
+            cookie_input_frame,
+            textvariable=self.cookie_test_url_var,
+            width=45,
+            bg=self.ENTRY_BG, fg=self.ENTRY_FG,
+            insertbackground=self.CURSOR_COLOR, # 游標顏色
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat"
+        ).pack(side="left", padx=8)
+
+        tk.Button(
+            cookie_input_frame,
+            text="執行 Cookie 權限測試",
+            command=lambda: self.check_cookies_thread(silent=False),
+            bg=self.COLOR_INFO,
+            fg="black",
+            padx=12,
+            cursor="hand2"
+        ).pack(side="left", padx=5)
+
+        # Cookie 狀態顯示
+        self.status_indicator = tk.Label(
+            config_frame,
+            textvariable=self.cookie_status_var,
+            bg=self.BG_COLOR,
+            fg=self.COLOR_WARNING,
+            font=("", 11, "bold")
+        )
+        self.status_indicator.pack(anchor="w", padx=5, pady=(0, 12))
+
+        # 分隔線
+        tk.Frame(config_frame, height=2, bd=0, bg=self.BORDER_COLOR).pack(
+            fill="x", pady=8
+        )
+
+        # 直播網址設定
+        url_frame = tk.Frame(config_frame, **frame_style)
+        url_frame.pack(fill="x", pady=(5, 0))
+        tk.Label(url_frame, text="直播網址:", **label_style).pack(side="left")
+        tk.Entry(
+            url_frame,
+            textvariable=self.channel_url,
+            width=50,
+            bg=self.ENTRY_BG, fg=self.ENTRY_FG,
+            insertbackground=self.CURSOR_COLOR,
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat"
+        ).pack(side="left", padx=8, fill="x", expand=True)
+
+        # 範例文字
+        tk.Label(
+            config_frame,
+            text="範例：https://www.youtube.com/@頻道名稱/live",
+            bg=self.BG_COLOR,
+            fg="#aaaaaa", # 灰色
+            font=("", 9)
+        ).pack(anchor="w", padx=10, pady=(2, 8))
+
+        # 檢測間隔設定
+        interval_frame = tk.Frame(config_frame, **frame_style)
+        interval_frame.pack(fill="x", pady=5)
+        tk.Label(interval_frame, text="檢測頻率:", **label_style).pack(side="left")
+        tk.Spinbox(
+            interval_frame,
+            from_=30,
+            to=3600,
+            textvariable=self.check_interval_var,
+            width=10,
+            validate='key',
+            validatecommand=(self.root.register(self._validate_number), '%P'),
+            bg=self.ENTRY_BG, fg=self.ENTRY_FG,
+            insertbackground=self.CURSOR_COLOR,
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat" # 扁平化風格
+        ).pack(side="left", padx=8)
+        tk.Label(interval_frame, text="秒", **label_style).pack(side="left", padx=2)
+        tk.Label(
+            interval_frame,
+            text="(建議 60 秒以上，避免被 YouTube 限制)",
+            bg=self.BG_COLOR,
+            fg="#aaaaaa",
+            font=("", 9)
+        ).pack(side="left", padx=8)
+
+        # 2. 影片測試下載區
+        test_frame = tk.LabelFrame(
+            self.main_container,
+            text="影片測試下載",
+            padx=15,
+            pady=12,
+            font=("", 10, "bold"),
+            fg=self.COLOR_INFO,
+            bg=self.BG_COLOR,
+            bd=1, relief="solid"
+        )
+        test_frame.pack(fill="x", padx=10, pady=8)
+
+        test_input_frame = tk.Frame(test_frame, **frame_style)
+        test_input_frame.pack(fill="x", pady=(0, 5))
+
+        tk.Label(
+            test_input_frame,
+            text="影片網址:",
+            **label_style
+        ).pack(side="left")
+
+        tk.Entry(
+            test_input_frame,
+            textvariable=self.test_video_url,
+            width=50,
+            bg=self.ENTRY_BG, fg=self.ENTRY_FG,
+            insertbackground=self.CURSOR_COLOR,
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat"
+        ).pack(side="left", padx=8, fill="x", expand=True)
+
+        tk.Button(
+            test_input_frame,
+            text="立即下載",
+            command=self.download_test_video,
+            bg=self.COLOR_SUCCESS,
+            fg="black",
+            padx=15,
+            cursor="hand2",
+            font=("", 10, "bold")
+        ).pack(side="left", padx=5)
+
+        tk.Label(
+            test_frame,
+            text="用於測試一般影片下載功能（非直播），檔案會存到相同目錄",
+            bg=self.BG_COLOR,
+            fg="#aaaaaa",
+            font=("", 9)
+        ).pack(anchor="w", padx=5)
+
+        # 3. 儲存路徑區
+        path_frame = tk.LabelFrame(
+            self.main_container,
+            text="存檔位置",
+            padx=15,
+            pady=12,
+            font=("", 10, "bold"),
+            bg=self.BG_COLOR, fg=self.TEXT_COLOR,
+            bd=1, relief="solid"
+        )
+        path_frame.pack(fill="x", padx=10, pady=8)
+
+        tk.Entry(
+            path_frame,
+            textvariable=self.download_dir,
+            width=60,
+            state='readonly',
+            bg=self.ENTRY_BG, fg=self.ENTRY_FG,
+            readonlybackground="#333333", # Readonly 深一點
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat"
+        ).pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        tk.Button(
+            path_frame,
+            text="選擇資料夾",
+            command=self.select_directory,
+            bg=self.COLOR_INFO,
+            fg="black",
+            padx=15,
+            cursor="hand2"
+        ).pack(side="right")
+
+        # 4. 控制區
+        control_frame = tk.Frame(self.main_container, pady=12, bg=self.BG_COLOR)
+        control_frame.pack(fill="x", padx=10)
+
+        self.btn_start = tk.Button(
+            control_frame,
+            text="開始自動監控 (Ctrl+S)",
+            command=self.toggle_monitoring,
+            bg=self.COLOR_PRIMARY,
+            fg="black",
+            font=("", 13, "bold"),
+            height=2,
+            cursor="hand2",
+            relief="raised",
+            bd=2
+        )
+        self.btn_start.pack(fill="x")
+
+        # 5. 狀態顯示區
+        status_frame = tk.LabelFrame(
+            self.main_container,
+            text="運作狀態與日誌",
+            padx=12,
+            pady=12,
+            font=("", 10, "bold"),
+            bg=self.BG_COLOR, fg=self.TEXT_COLOR,
+            bd=1, relief="solid"
+        )
+        status_frame.pack(fill="both", expand=True, padx=10, pady=8)
+
+        # 日誌控制按鈕
+        log_control_frame = tk.Frame(status_frame, **frame_style)
+        log_control_frame.pack(fill="x", pady=(0, 5))
+
+        tk.Button(
+            log_control_frame,
+            text="清除日誌 (Ctrl+L)",
+            command=self.clear_logs,
+            bg="#95a5a6",
+            fg="black",
+            padx=10,
+            cursor="hand2"
+        ).pack(side="right")
+
+        self.log_text = scrolledtext.ScrolledText(
+            status_frame,
+            height=15,
+            state='disabled',
+            font=("Courier", 10),
+            wrap="word",
+            bg="#1e1e1e", fg="#00ff00", # 黑底綠字 (駭客風格日誌，對比度最高)
+            highlightbackground=self.BORDER_COLOR,
+            relief="flat"
+        )
+        self.log_text.pack(fill="both", expand=True)
+
+        # 底部狀態列
+        self.status_label = tk.Label(
+            self.main_container,
+            text="就緒 | Ctrl+S: 開始/停止 | Ctrl+L: 清除日誌",
+            bd=1,
+            relief=tk.SUNKEN,
+            anchor=tk.W,
+            font=("", 9),
+            bg="#1e1e1e", fg="white" # 狀態列深底白字
+        )
+        self.status_label.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _validate_number(self, value):
+        """驗證數字輸入"""
+        return value == "" or value.isdigit()
+
+    def _validate_url(self, url):
+        """驗證 URL 格式"""
+        url_pattern = re.compile(
+            r'^https?://(www\.)?youtube\.com/.+$'
+        )
+        return bool(url_pattern.match(url))
+
+    def log(self, message):
+        """執行緒安全的日誌輸出"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        full_msg = f"[{timestamp}] {message}"
+
+        def _update():
+            self.log_text.config(state='normal')
+            self.log_text.insert(tk.END, full_msg + "\n")
+            self.log_text.see(tk.END)
+            self.log_text.config(state='disabled')
+
+        self.root.after(0, _update)
+        self.root.after(0, lambda: self.status_label.config(
+            text=message[:100] + "..." if len(message) > 100 else message
+        ))
+
+    def clear_logs(self):
+        """清除日誌"""
+        self.log_text.config(state='normal')
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.config(state='disabled')
+        self.log("日誌已清除")
+    
+    def update_ytdlp(self):
+        """更新 yt-dlp"""
+        def _update_thread():
+            self.log("🔄 正在更新 yt-dlp，請稍候...")
+            try:
+                # 嘗試使用 pip 更新
+                cmd = ["pip3", "install", "--upgrade", "yt-dlp"]
+                result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                
+                if result.returncode == 0:
+                     self.log("✅ pip 更新成功！")
+                else:
+                    # 如果 pip 失敗，嘗試使用 yt-dlp 自帶更新 (雖然 brew 安裝的通常不允許這樣做)
+                    self.log("⚠️ pip 更新未回傳成功，嘗試 brew 或內建更新...")
+                    cmd_self = ["yt-dlp", "-U"]
+                    result_self = subprocess.run(cmd_self, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    self.log(f"📝 更新結果: {result_self.stdout} {result_self.stderr}")
+                
+                self.log("✅ 更新程序結束，請重試錄製。")
+                self.root.after(0, lambda: messagebox.showinfo("更新完成", "更新程序已執行，請查看日誌確認結果。"))
+                
+            except Exception as e:
+                self.log(f"❌ 更新失敗: {e}")
+
+        threading.Thread(target=_update_thread, daemon=True).start()
+
+    def select_directory(self):
+        """選擇下載目錄"""
+        path = filedialog.askdirectory(initialdir=self.download_dir.get())
+        if path:
+            self.download_dir.set(path)
+            self.log(f"已更改下載路徑: {path}")
+
+    def download_test_video(self):
+        """下載測試影片"""
+        url = self.test_video_url.get().strip()
+
+        if not url:
+            messagebox.showwarning("警告", "請輸入影片網址")
+            return
+
+        if not self._validate_url(url):
+            messagebox.showerror("錯誤", "請輸入有效的 YouTube 網址")
+            return
+
+        self.log(f"📥 開始下載測試影片...")
+
+        # 在新執行緒中下載
+        threading.Thread(
+            target=self._download_video_impl,
+            args=(url,),
+            daemon=True
+        ).start()
+
+    def _download_video_impl(self, url):
+        """執行影片下載（修復 bot 檢測問題）"""
+        output_dir = self.download_dir.get()
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            self.log(f"❌ 無法創建目錄: {e}")
+            return
+
+        output_path = os.path.join(output_dir, "%(title)s-%(id)s.%(ext)s")
+
+        # 403 錯誤修復：加入 User-Agent, Referer 和 --no-cache-dir
+        command = [
+            "yt-dlp",
+            "--no-cache-dir",  # 關鍵：清除快取
+            "--cookies-from-browser", "chrome",
+            "--user-agent", self.USER_AGENT, # 偽裝 User Agent
+            "--referer", self.REFERER,
+            "--remote-components", "ejs:github",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "-o", output_path,
+            "--newline",
+            "--progress",
+            url
+        ]
+
+        self.log("🔧 使用強化版參數 (Anti-403 Mode)...")
+
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=False,
+                bufsize=1
+            )
+
+            for line in process.stdout:
+                line = line.strip()
+                if line:
+                    if "WARNING" in line and "Remote components" in line:
+                        continue
+
+                    if "Destination:" in line or "Merging" in line:
+                        self.log(f"📝 {line}")
+                    elif "[download]" in line and "%" in line:
+                        if any(x in line for x in ["10%", "20%", "30%", "40%", "50%", 
+                                                     "60%", "70%", "80%", "90%", "100%"]):
+                            self.log(f"⏬ {line}")
+                    elif "ETA" in line or "at" in line:
+                        if line.startswith("[download]"):
+                            self.log(f"⏬ {line}")
+
+            process.wait()
+
+            if process.returncode == 0:
+                self.log("✅ 影片下載完成！")
+                self.root.after(0, lambda: messagebox.showinfo("成功", "影片下載完成！"))
+            else:
+                self.log(f"❌ 下載失敗，返回碼: {process.returncode}")
+                self.root.after(0, lambda: messagebox.showerror("錯誤", "影片下載失敗，請檢查日誌"))
+
+        except FileNotFoundError:
+            self.log("❌ 找不到 yt-dlp 工具")
+            self.root.after(0, lambda: messagebox.showerror(
+                "錯誤", 
+                "找不到 yt-dlp\n\n請先安裝：brew install yt-dlp"
+            ))
+        except Exception as e:
+            self.log(f"❌ 下載錯誤: {str(e)}")
+            self.root.after(0, lambda: messagebox.showerror("錯誤", f"下載錯誤: {str(e)}"))
+
+    def check_cookies_thread(self, silent=False):
+        """啟動 Cookie 檢查執行緒"""
+        threading.Thread(
+            target=self._check_cookies_impl,
+            args=(silent,),
+            daemon=True
+        ).start()
+
+    def _check_cookies_impl(self, silent=False):
+        """執行 Cookie 檢查（修復 bot 檢測問題）"""
+        test_url = self.cookie_test_url_var.get().strip()
+
+        if not test_url:
+            test_url = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+        if not self._validate_url(test_url):
+            self.log("❌ 無效的 YouTube 網址")
+            self._update_cookie_ui(False, "❌ 網址格式錯誤", self.COLOR_ERROR)
+            return
+
+        if not silent:
+            self.log(f"正在檢查 Cookie 權限...")
+            self._update_cookie_ui(False, "檢查中...", self.COLOR_WARNING)
+
+        # 403 錯誤修復：同步使用偽裝參數
+        command = [
+            "yt-dlp",
+            "--no-cache-dir",
+            "--cookies-from-browser", "chrome",
+            "--user-agent", self.USER_AGENT,
+            "--referer", self.REFERER,
+            "--remote-components", "ejs:github",
+            "--print", "title",
+            test_url
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=60,
+                shell=False
+            )
+
+            if result.returncode == 0:
+                title = result.stdout.strip()
+                success_msg = f"✅ 驗證成功 (標題: {title[:25]}...)"
+                self._update_cookie_ui(True, success_msg, self.COLOR_SUCCESS)
+                if not silent:
+                    self.log(f"✅ Cookie 有效！成功讀取影片: {title}")
+                    self.root.after(0, lambda: messagebox.showinfo(
+                        "驗證成功",
+                        f"Cookie 運作正常！\n\n影片標題：{title}\n\n"
+                        "如果這是會員限定內容，代表權限已正確抓取。"
+                    ))
+            else:
+                self._update_cookie_ui(False, "❌ 存取失敗", self.COLOR_ERROR)
+                error_msg = result.stderr
+                if "WARNING" not in error_msg or "Remote components" not in error_msg:
+                    self.log(f"❌ Cookie 檢查失敗: {error_msg[:100]}")
+                if not silent:
+                    self._show_cookie_error(error_msg)
+
+        except FileNotFoundError:
+            self._update_cookie_ui(False, "❌ 找不到 yt-dlp", self.COLOR_ERROR)
+            if not silent:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "錯誤",
+                    "找不到 yt-dlp 工具。\n\n請先安裝：\nbrew install yt-dlp"
+                ))
+        except subprocess.TimeoutExpired:
+            self._update_cookie_ui(False, "❌ 檢查超時", self.COLOR_ERROR)
+            self.log("❌ Cookie 檢查超時（60秒）")
+        except Exception as e:
+            self._update_cookie_ui(False, "❌ 錯誤", self.COLOR_ERROR)
+            self.log(f"❌ 未知錯誤: {str(e)}")
+
+    def _show_cookie_error(self, stderr):
+        """顯示 Cookie 錯誤詳情"""
+        err_msg = "無法讀取影片資訊。\n\n"
+
+        if "Sign in to confirm" in stderr or "age" in stderr.lower():
+            err_msg += "原因：需要登入（Cookie 無效或未抓取）"
+        elif "Private video" in stderr:
+            err_msg += "原因：這是私人影片（需要特定權限）"
+        elif "Members-only" in stderr or "members only" in stderr.lower():
+            err_msg += "原因：會員限定內容，但您的 Cookie 沒有權限"
+        elif "403" in stderr:
+            err_msg += "原因：403 禁止訪問。可能是 IP 被擋或 yt-dlp 需要更新。"
+        else:
+            err_msg += f"錯誤詳情：{stderr[:200]}"
+
+        err_msg += ("\n\n建議操作：\n"
+                   "1. 使用介面上的按鈕更新 yt-dlp\n"
+                   "2. 開啟 Chrome 並登入 YouTube，確認影片可播放\n"
+                   "3. 完全關閉 Chrome 後重試")
+
+        self.root.after(0, lambda: messagebox.showerror("驗證失敗", err_msg))
+
+    def _update_cookie_ui(self, success, text, color):
+        """更新 Cookie 狀態介面"""
+        def _update():
+            self.cookie_status_var.set(text)
+            self.status_indicator.config(fg=color)
+        self.root.after(0, _update)
+
+    def toggle_monitoring(self):
+        """切換監控狀態"""
+        if not self.is_monitoring:
+            # 驗證輸入
+            try:
+                interval = int(self.check_interval_var.get())
+                if interval < 10:
+                    messagebox.showerror(
+                        "錯誤",
+                        "檢測間隔不能小於 10 秒"
+                    )
+                    return
+                elif interval < 30:
+                    if not messagebox.askyesno(
+                        "警告",
+                        "檢測間隔小於 30 秒可能導致 IP 被 YouTube 限制。\n確定繼續？"
+                    ):
+                        return
+            except ValueError:
+                messagebox.showerror("錯誤", "檢測頻率必須是有效數字")
+                return
+
+            # 驗證 URL
+            url = self.channel_url.get().strip()
+            if not self._validate_url(url):
+                messagebox.showerror("錯誤", "請輸入有效的 YouTube 網址")
+                return
+
+            # 開始監控
+            self.is_monitoring = True
+            self.stop_event.clear()
+            self.btn_start.config(
+                text="停止監控 (Ctrl+S)",
+                bg=self.COLOR_DANGER
+            )
+            self.log(f"=== 開始監控 (間隔: {interval}秒) ===")
+
+            self.monitor_thread = threading.Thread(
+                target=self.monitor_loop,
+                daemon=True
+            )
+            self.monitor_thread.start()
+        else:
+            # 停止監控
+            self.is_monitoring = False
+            self.stop_event.set()
+            self.btn_start.config(
+                text="開始自動監控 (Ctrl+S)",
+                bg=self.COLOR_PRIMARY
+            )
+            self.log("⏸ 正在停止監控...")
+
+    def is_live(self, url):
+        """檢查是否正在直播（修復 bot 檢測問題）"""
+        # 403 錯誤修復：同步使用偽裝參數
+        command = [
+            "yt-dlp",
+            "--no-cache-dir",
+            "--cookies-from-browser", "chrome",
+            "--user-agent", self.USER_AGENT,
+            "--referer", self.REFERER,
+            "--remote-components", "ejs:github",
+            "--get-title",
+            url
+        ]
+
+        try:
+            result = subprocess.run(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30,
+                shell=False
+            )
+
+            if result.returncode == 0:
+                title = result.stdout.strip()
+                self.log(f"🎉 檢測到直播: {title}")
+                return True
+            else:
+                stderr = result.stderr.strip()
+                if "will begin in" in stderr:
+                    self.log("ℹ️ 預定直播尚未開始")
+                return False
+
+        except subprocess.TimeoutExpired:
+            self.log("⚠️ 檢測超時")
+            return False
+        except Exception as e:
+            self.log(f"⚠️ 檢測錯誤: {str(e)}")
+            return False
+
+    def record_live_stream(self, url):
+        """錄製直播（修復所有問題）"""
+        output_dir = self.download_dir.get()
+
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except Exception as e:
+            self.log(f"❌ 無法創建目錄: {e}")
+            return
+
+        output_path = os.path.join(output_dir, "%(title)s-%(id)s.%(ext)s")
+
+        # 完整修復的命令 (針對 403 錯誤與直播斷線)
+        command = [
+            "yt-dlp",
+            "--ignore-config", # 忽略本地設定檔，避免衝突
+            "--no-cache-dir",  # 關鍵：解決 403 重複發生
+            "--cookies-from-browser", "chrome",
+            "--user-agent", self.USER_AGENT, # 偽裝為 Mac Chrome
+            "--referer", self.REFERER,
+            "--remote-components", "ejs:github",
+            "--live-from-start",
+            "--wait-for-video", "5-60",
+            "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--hls-use-mpegts",
+            # 如果還是 403，可以嘗試移除 concurrent-fragments 讓下載變慢但更穩定
+            "--concurrent-fragments", "5", 
+            "--no-part",
+            "--newline",
+            "--progress",
+            "-o", output_path,
+            url
+        ]
+
+        self.log("🚀 啟動錄製...")
+        self.log("🔧 使用 Bot 防護繞過機制 (No-Cache + UA Spoof)...")
+
+        process = None
+        try:
+            start_time = time.time()
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                shell=False,
+                bufsize=1
+            )
+
+            last_log_time = 0
+            for line in process.stdout:
+                line = line.strip()
+                if line:
+                    # 過濾 WARNING 訊息
+                    if "WARNING" in line and "Remote components" in line:
+                        continue
+
+                    current_time = time.time()
+                    # 每10秒輸出一次進度
+                    if current_time - last_log_time >= 10:
+                        if "[download]" in line:
+                            self.log(f"⏬ {line}")
+                            last_log_time = current_time
+
+                    # 重要訊息立即顯示
+                    if "Destination:" in line or "Merging" in line or "ERROR" in line:
+                        self.log(f"📝 {line}")
+                    
+                    # 偵測到 403 時提示使用者
+                    if "HTTP Error 403" in line and "Retrying" not in line:
+                        self.log(f"⚠️ 偵測到 403 拒絕訪問，請嘗試更新 yt-dlp 或更換 IP")
+
+                if self.stop_event.is_set():
+                    process.terminate()
+                    self.log("⏹ 使用者停止錄製")
+                    break
+
+                elapsed = int(time.time() - start_time)
+                h, remainder = divmod(elapsed, 3600)
+                m, s = divmod(remainder, 60)
+
+                def update_status():
+                    self.status_label.config(
+                        text=f"🔴 錄製中... {h:02d}:{m:02d}:{s:02d}"
+                    )
+                self.root.after(0, update_status)
+
+            process.wait()
+
+            if process.returncode == 0:
+                self.log("✅ 錄製完成！")
+            elif not self.stop_event.is_set():
+                self.log(f"⚠️ 錄製結束（返回碼: {process.returncode}）")
+
+        except Exception as e:
+            self.log(f"❌ 錄製錯誤: {str(e)}")
+        finally:
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except Exception:
+                    process.kill()
+
+    def monitor_loop(self):
+        """主監控迴圈"""
+        url = self.channel_url.get().strip()
+
+        while not self.stop_event.is_set():
+            try:
+                check_interval = int(self.check_interval_var.get())
+            except ValueError:
+                check_interval = 120
+
+            self.log(f"🔍 檢測直播狀態...")
+
+            if self.is_live(url):
+                self.log("📡 確認直播信號，準備錄製...")
+                time.sleep(3)
+                self.record_live_stream(url)
+
+                # 錄製後冷卻
+                self.log("💤 錄製結束，冷卻 60 秒...")
+                for _ in range(60):
+                    if self.stop_event.is_set():
+                        break
+                    time.sleep(1)
+            else:
+                # 倒數計時等待
+                for i in range(check_interval):
+                    if self.stop_event.is_set():
+                        break
+
+                    if i % 10 == 0:
+                        remaining = check_interval - i
+                        def update_waiting():
+                            self.status_label.config(
+                                text=f"⏳ 等待下次檢測... 剩餘 {remaining} 秒"
+                            )
+                        self.root.after(0, update_waiting)
+
+                    time.sleep(1)
+
+        self.log("=== 監控已停止 ===")
+        self.root.after(0, lambda: self.status_label.config(text="就緒"))
+
+if __name__ == "__main__":
+    try:
+        root = tk.Tk()
+        app = YTRecorderApp(root)
+        root.mainloop()
+    except tk.TclError as e:
+        # 捕捉無顯示器錯誤，顯示友善提示
+        if "no display name" in str(e) or "no $DISPLAY" in str(e):
+            print("\n=======================================================")
+            print("❌ 錯誤：無法啟動圖形介面 (No Display Found)")
+            print("=======================================================")
+            print("原因：此程式為視窗應用程式 (GUI)，無法在雲端 Shell 或無螢幕伺服器執行。")
+            print("\n解決方法：")
+            print("1. 請將此檔案 (YT_recorder_v3_fixed.py) 下載到您的 macOS 電腦。")
+            print("2. 開啟終端機 (Terminal)。")
+            print("3. 輸入指令：python3 /您的下載路徑/YT_recorder_v3_fixed.py")
+            print("=======================================================\n")
+        else:
+            raise e
